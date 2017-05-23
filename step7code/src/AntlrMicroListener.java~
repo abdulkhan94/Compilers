@@ -1,0 +1,667 @@
+import java.io.*;
+import org.antlr.v4.runtime.ANTLRFileStream;
+import org.antlr.v4.runtime.*;
+import java.util.Scanner;
+import java.util.LinkedList;
+import java.util.Stack;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.io.PrintWriter;
+import java.util.HashMap;
+
+/**
+ * All variables are defined globally, none are defined within main.
+ * There is only the main function with no calls to other functions.
+ * Loops and if statement are NOT included.
+ *
+ * Get a list of variable declarations. These are decalared as, "var a", for the tinycode but not used for the IR code.
+ *     RuleName = var_decl
+ * Go line by line grabbing each assignment expression and READ/WRTITE expressions.
+ * Make sure to preserve the order of in which the assignments occur as well as the READ/WRITE occurances.
+ *     Rule for READ/WRITE = read_stmt / write_stmt
+ *     Rule for variable expressions = assign_expr
+ *
+ * Note: The order should be preserved by the walker since the functions for each rule execute as the walker comes across each section designated by the rule
+ *
+ *
+ * How am I going to build the IR representation?
+ * Rules where the components are other rules will require a separate recursive function in order to go through each rule layer.
+ * The purpose of the separate function will be to parse the parts of the context component that we need in order to create our instruction.
+ * Variable declarations should not be part of the IR code, so we can add them to the linked list but not print them in the IR code.
+ *      The declarations will always come first since none are declared within main.
+ */
+
+public class AntlrMicroListener extends MicroBaseListener {
+    public static final String MUL = "*";
+    public static final String DIV = "/";
+    public static final String ADD = "+";
+    public static final String SUB = "-";
+    public static final String LPAR = "(";
+    public static final String RPAR = ")";
+
+    public static final String LT = "<";
+    public static final String GT = ">";
+    public static final String EQ = "=";
+    public static final String NEQ = "!=";
+    public static final String LTE = "<=";
+    public static final String GTE = ">=";
+
+    private IR_NodeList inter_rep;
+    private ArrayList<Func_decl> func_list;
+    private LinkedList<Tiny_Node> tiny_varDecl;
+    private ArrayList<String> expr_comp;//Note that this is being used as a stack
+    private Stack<Integer> labels;
+    private int labelCounter;
+    private boolean insideCallExpr;
+    private int func_declCounter;
+    private boolean insideFunc_body;
+
+    public AntlrMicroListener(){
+	func_list = new ArrayList<Func_decl>();
+	func_list.add(new Func_decl("GLOBAL", "VOID"));
+	inter_rep = func_list.get(0).getInter_rep();
+	inter_rep.addHeader();
+
+	tiny_varDecl = new LinkedList<Tiny_Node>();
+	expr_comp = new ArrayList<String>();
+	labels = new Stack<Integer>();
+	labelCounter = 1;
+	insideCallExpr = false;
+	func_declCounter = 0;
+	insideFunc_body = false;
+
+    }
+    
+    public IR_NodeList getInterRepCollection(){
+	//Append all of the inter_reps from the func_list
+	IR_NodeList collection = new IR_NodeList();
+
+	for(int i = 0; i < func_list.size(); i++){
+	    collection.append(func_list.get(i).getInter_rep());
+	}
+
+	//collection.print();
+	return collection;
+    }
+
+    public ArrayList<Func_decl> getFunc_list(){
+	return func_list;
+    }
+
+    public LinkedList<Tiny_Node> getTiny_varDecl(){
+	return tiny_varDecl;
+    }
+
+    public void printIR_rep(PrintWriter writer){
+	IR_NodeList collection = this.getInterRepCollection();
+
+	for(int i = 0; i < collection.size(); i++){
+	    IR_Node node = collection.get(i);
+	    node.print(writer);
+	}
+    }
+
+    public void printExpr_comp(){
+	for(int i = 0; i < expr_comp.size(); i++){
+	    System.out.println(expr_comp.get(i));
+	}
+    }
+
+    @Override
+    public void exitReturn_stmt(MicroParser.Return_stmtContext ctx){
+	String location = traverseExpression(expr_comp);
+	//inter_rep.addRegToTypeDictionary(location, 
+
+	inter_rep.createStoreIR_Node(location, "$R");
+	inter_rep.createRetIR_Node();
+    }
+
+    @Override
+    public void enterFunc_decl(MicroParser.Func_declContext ctx){
+	//Set the current function declaration's parameters to those being used in the listener.
+	//Set the P,L,T-Dictionary by setting inter_rep to the function declaration's inter_rep
+	//Set the labal stack to that of the function declaration's label stack.
+
+	//Create a new func_decl
+	//Do we also need to keep track of the type?
+	String funcName = ctx.id().getText();
+	String funcType = ctx.any_type().getText();
+	
+	Func_decl currentFunc = new Func_decl(funcName, funcType, func_list.get(0).getInter_rep());
+	func_list.add(currentFunc);
+	inter_rep = currentFunc.getInter_rep();
+	inter_rep.addFuncHeader(funcName);	
+	func_declCounter++;
+    }
+
+    /*
+    @Override
+    public void enterFunc_body(MicroParser.Func_bodyContext ctx){
+	insideFunc_body = true;
+    }
+
+    @Override
+    public void exitFunc_body(MicroParser.Func_bodyContext ctx){
+	insideFunc_body = false;
+    }
+
+    @Override
+    public void exitDecl(MicroParser.DeclContext ctx){
+	if(insideFunc_body){//This only works if there are no declarations inside a function besides at the beginning
+	    String reg = inter_rep.getCurrentLocalRegister();
+	    int regNum = Integer.parseInt(reg.substring(reg.length()-1, reg.length())) - 1;
+	    inter_rep.createLinkIR_Node(regNum);
+	}
+    }*/
+
+    @Override
+    public void exitExpr(MicroParser.ExprContext ctx){
+	if(insideCallExpr){
+	    expr_comp.add("--");
+	}
+    }
+
+    @Override
+    public void enterExpr(MicroParser.ExprContext ctx){
+	if(insideCallExpr){
+	    expr_comp.add("--");
+	}
+    }
+
+    @Override
+    public void enterCall_expr(MicroParser.Call_exprContext ctx){
+	insideCallExpr = true;
+    }    
+
+    @Override
+    public void exitCall_expr(MicroParser.Call_exprContext ctx){
+	//Handle void functions differently b/c they can be called outside of an assign_stmt or cond
+	
+	String expr_list = ctx.expr_list().getText();
+	String[] params = expr_list.split(",");
+	int paramCount = params.length;
+
+	//Go through expr_comp until all of the parameters have been found and evaluated
+	ArrayList<String> parameterReversed = new ArrayList<String>();
+	ArrayList<String> parameter = new ArrayList<String>();
+	String[] paramLocations = new String[paramCount];
+
+	for(int i = 0; i < paramCount; i++){
+	    //Each Paramater is individually extracted from expr_comp
+	    //Then passed to traverseExpression
+	    expr_comp.remove(0);//The first dash
+	    while(! expr_comp.get(0).equals("--")){
+		parameterReversed.add(expr_comp.get(0));
+		expr_comp.remove(0);
+	    }
+	    expr_comp.remove(0);//The last dash
+	    while(!parameterReversed.isEmpty()){
+		parameter.add(parameterReversed.get(0));
+		parameterReversed.remove(0);
+	    }
+	    paramLocations[i] = traverseExpression(parameter);
+	}
+
+	//Create push nodes for each paramter's location
+	inter_rep.createPushIR_Node("");
+	for(int i = 0; i < paramCount; i++){
+	    inter_rep.createPushIR_Node(paramLocations[i]);	    
+	}
+
+	//Create jsr node
+	inter_rep.createJsrIR_Node(ctx.id().getText());
+
+	//Create pop nodes
+	for(int i = 0; i < paramCount; i++){
+	    inter_rep.createPopIR_Node("");
+	    
+	}
+	
+	String resultReg = inter_rep.getCurrentTempRegister();
+	inter_rep.createPopIR_Node(resultReg);
+
+	int funcIndex = getFunc_listIndexOf(ctx.id().getText());
+	inter_rep.addRegToTypeDictionary(resultReg, func_list.get(funcIndex).getType());
+	
+	//If the function is not void then store the function call result on the expr_comp stack
+	boolean isFuncVoid = false;
+	for(int i = 0; i < func_list.size(); i++){
+	    if(func_list.get(i).getName().equals(ctx.id().getText())){
+		isFuncVoid = true;
+	    }
+	}
+	
+	if(! isFuncVoid){
+	    expr_comp.add(resultReg);
+	}
+
+
+
+	insideCallExpr = false;
+    }
+
+    //We need a way to lookup function names, to find the return value of a function call
+    private int getFunc_listIndexOf(String functionName){
+	for(int i = 0; i < func_list.size(); i++){
+	    if(func_list.get(i).getName().equals(functionName)){
+		return i;
+	    }
+	}
+
+	return -1;
+    }
+
+    @Override
+    public void exitParam_decl(MicroParser.Param_declContext ctx){
+	String[] paramList = ctx.getText().split(",");
+
+	for(int i = 0; i < paramList.length; i++){
+	    String type;
+	    String id;
+	    if(paramList[i].startsWith("FLOAT")){
+		type = "FLOAT";
+		id = paramList[i].split("FLOAT")[1];
+
+	    } else if(paramList[i].startsWith("INT")){
+		type = "INT";
+		id = paramList[i].split("INT")[1];
+
+	    } else {
+		type = "STRING";
+		id = paramList[i].split("STRING")[1];
+
+	    }
+
+	    inter_rep.addToDictionaries(id, inter_rep.getCurrentParamRegister(), type);
+	}
+    }
+
+    @Override
+    public void exitVar_decl(MicroParser.Var_declContext ctx){
+	MicroParser.Id_listContext varNames = ctx.id_list();
+	MicroParser.Var_typeContext varType = ctx.var_type();
+	String[] varList = varNames.getText().split(",");
+	
+	if(func_declCounter > 0){//We are outside of the global scope and inside a func_decl
+	    for(int i = 0; i < varList.length; i++){
+		inter_rep.addToDictionaries(varList[i], inter_rep.getCurrentLocalRegister(), varType.getText());
+		
+	    }
+	    
+	} else {//We are still at the global declarations
+
+	    for(int i = 0; i < varList.length; i++){
+		Tiny_Node node = new Tiny_Node("var", varList[i], "");
+		tiny_varDecl.add(node);
+
+		inter_rep.typeDictionaryPut(varList[i], varType.getText());
+	    }
+	}
+
+	return;
+    }
+
+    @Override
+    public void exitString_decl(MicroParser.String_declContext ctx){
+	String varName = ctx.id().getText();
+	String value = ctx.str().getText();
+
+	//Assumed to be global scope
+	Tiny_Node node = new Tiny_Node("str", varName, value);
+	tiny_varDecl.add(node);
+
+	inter_rep.typeDictionaryPut(varName, "STRING");
+
+    }
+
+    @Override
+    public void exitRead_stmt(MicroParser.Read_stmtContext ctx){
+	String varList = ctx.id_list().getText();
+	
+	//use createReadOpNode()
+	String[] ids = varList.split(",");
+	
+	for(int i = 0; i < ids.length; i++){
+	    inter_rep.createReadIR_Node(ids[i]);
+	}
+	
+    }
+
+    @Override
+    public void exitWrite_stmt(MicroParser.Write_stmtContext ctx){
+	String varList = ctx.id_list().getText();
+
+	//use createWriteOpNode()
+	String[] ids = varList.split(",");
+
+	for(int i = 0; i < ids.length; i++){
+	    inter_rep.createWriteIR_Node(ids[i]);
+	}
+
+    }
+
+    @Override
+    public void enterPrimary(MicroParser.PrimaryContext ctx){
+	String temp = ctx.getText();
+	String firstChar = String.valueOf(temp.charAt(0));
+	if(firstChar.equals(LPAR)){
+	    expr_comp.add(LPAR);
+	} else {
+	    expr_comp.add(temp);
+	}
+
+    }
+
+    @Override
+    public void exitPrimary(MicroParser.PrimaryContext ctx){
+	String temp = ctx.getText();
+	String lastChar = String.valueOf(temp.charAt(temp.length() - 1));
+	if(lastChar.equals(RPAR)){
+	    expr_comp.add(RPAR);
+	}
+    }
+
+    @Override
+    public void exitAddop(MicroParser.AddopContext ctx){
+	expr_comp.add(ctx.getText());
+
+    }
+
+    @Override
+    public void exitMulop(MicroParser.MulopContext ctx){
+	expr_comp.add(ctx.getText());	
+	
+    }
+
+    @Override 
+    public void exitDo_while_stmt(MicroParser.Do_while_stmtContext ctx){
+	Integer temp = labels.pop();
+	inter_rep.createJumpIR_Node(labels.pop().toString());
+	inter_rep.createLabelIR_Node(temp.toString());
+
+	if(labels.empty()){
+	    //labelCounter = 1;
+	}
+    }
+
+    @Override 
+    public void enterDo_while_stmt(MicroParser.Do_while_stmtContext ctx){
+	labels.push(labelCounter);
+	inter_rep.createLabelIR_Node(labels.peek().toString());
+	labelCounter++;
+
+	labels.push(labelCounter);
+	labelCounter++;	
+    }
+
+    @Override
+    public void exitIf_stmt(MicroParser.If_stmtContext ctx){
+	inter_rep.createLabelIR_Node(labels.pop().toString());
+
+	if(labels.empty()){
+	    //labelCounter = 1;
+	}
+    }
+
+    @Override
+    public void enterIf_stmt(MicroParser.If_stmtContext ctx){
+	//Arrange the labels
+	labels.push(labelCounter+1);//label for the end of the if_stmt
+	labels.push(labelCounter);//label before the else_part of the if_stmt
+	labelCounter += 2;
+
+    }
+
+    @Override
+    public void enterElse_part(MicroParser.Else_partContext ctx){
+	//Would this work for if()elseif()elseif()? I think so
+	Integer temp = labels.pop();
+	inter_rep.createJumpIR_Node(labels.peek().toString());//Jump to end of the if_stmt, given previous condition was satisfied
+	inter_rep.createLabelIR_Node(temp.toString());//label before the else_part begins, given the previous condition failed
+
+	if(ctx != null && ctx.cond() != null){//the case of elseif(cond)
+	    labels.push(labelCounter);
+	    labelCounter++;
+	}
+    }
+
+    @Override
+    public void exitCompop(MicroParser.CompopContext ctx){
+	expr_comp.add(ctx.getText());
+
+    }
+
+    @Override
+    public void exitCond(MicroParser.CondContext ctx){
+	if(ctx.getText().equals("TRUE")){
+	    //Do nothing, no branching needed.
+	    return;
+	} else if(ctx.getText().equals("FALSE")){
+	    inter_rep.createJumpIR_Node(labels.peek().toString());
+	    return;
+	}
+
+	ArrayList<String> expr1 = grabCondLhs(expr_comp);
+	String compOp = expr_comp.get(0);
+	expr_comp.remove(0);
+
+	/*
+	System.out.println("expr1: " + expr1.get(0));
+	System.out.println("compop: " + compOp);
+	System.out.println("expr2: " + expr_comp.get(0));
+	*/
+
+	//Create IR nodes for lhs and rhs
+	String expr1Dest = traverseExpression(expr1);
+	String expr2Dest = traverseExpression(expr_comp);
+	
+	//Create the conditional IR Node
+	inter_rep.createCondIR_Node(expr1Dest, expr2Dest, compOp, labels.peek().toString());
+	
+    }
+
+    //Grabs everything in an expression until a comop
+    private ArrayList<String> grabCondLhs(ArrayList<String> cond){
+	ArrayList<String> expr1 = new ArrayList<String>();
+	boolean foundCompOp = false;
+	
+	for(int i = 0; i < cond.size() && (foundCompOp == false); i++){
+	    String item = cond.get(0);
+	    switch(item){
+	    case GT:		
+		foundCompOp = true;
+		break;
+	    case LT:
+		foundCompOp = true;
+		break;
+	    case EQ:
+		foundCompOp = true;		
+		break;
+	    case NEQ:
+		foundCompOp = true;
+		break;
+	    case LTE:
+		foundCompOp = true;
+		break;
+	    case GTE:
+		foundCompOp = true;
+		break;
+	    default:
+		expr1.add(item);
+		cond.remove(0);
+	    }
+
+	    //System.out.println(item);
+	}
+
+	return expr1;
+    }
+
+    /*
+    @Override
+    public void enterAssign_expr(MicroParser.Assign_exprContext ctx){
+	String lhs = ctx.id().getText();
+	MicroParser.ExprContext rhs = ctx.expr();
+	
+	expr_comp.add(lhs);
+       	
+    }
+
+    @Override
+    public void exitAssign_stmt(MicroParser.Assign_stmtContext ctx){    
+	
+
+    }*/
+
+    @Override
+    public void exitAssign_expr(MicroParser.Assign_exprContext ctx){    
+	String lhs = ctx.id().getText();	
+
+	//The arraylist has been filled with the expression, now create the IR_Nodes
+	//printExpr_comp();
+
+	//System.out.println("Line: " + ctx.getText());
+	createExpressionIR_nodes(lhs);
+    }
+
+    //Note that removing an item from an array list causes the others to shift over.
+    //Adjust your index correctly when removing items.
+    //If we are always grabbing and removing the first element this can behave as a stack.
+    private void createExpressionIR_nodes(String lhs){
+	//printExpr_comp();	
+	String rhsResult = traverseExpression(expr_comp);
+
+	//System.out.println(lhs + " = " + rhsResult);
+	//System.out.println("createExpressionIR_nodes - store");
+	inter_rep.createStoreIR_Node(rhsResult, lhs);//rhs stored to the lhs
+    }
+
+
+
+    private ArrayList<String> grabSubExpression(ArrayList<String> expression){
+	ArrayList<String> subExp = new ArrayList<String>();
+	
+	for(int i = 0; !expression.isEmpty(); i++){
+	    String temp = expression.get(0);
+	    expression.remove(0);
+	    
+	    if(temp.equals(RPAR)){
+		break;
+	    }
+	    
+	    subExp.add(temp);
+	}
+
+	return subExp;
+    }
+
+    //Returns the register location that the result of computeStack is stored in
+    private String executeStack(Stack<String> computeStack){
+	//var2 is grabbed first b/c expression is pushed left -> right and popped right -> left
+	String var2 = computeStack.pop();
+	String destination = inter_rep.getCurrentTempRegister();
+
+	//System.out.println("Execute Stack: " + var2);
+
+	if(computeStack.empty()){//Modification here for using multiple types of registers
+	    String result = inter_rep.replaceValueWithReg(var2);
+	    if(result.startsWith("$")){
+		return result;
+	    }
+
+	    //System.out.println("ExecuteStack - store");
+	    inter_rep.createStoreIR_Node(result, destination);
+
+	    return destination;
+	}
+
+	String op, var1;
+	while(!computeStack.empty()){
+	    op = computeStack.pop();
+	    var1 = computeStack.pop();
+	    
+	    //System.out.println("Execute Stack: " + op);
+	    //System.out.println("Execute Stack: " + var1);
+	    
+
+	    //destination is not updated for more efficient register use
+	    destination = inter_rep.getCurrentTempRegister();
+
+	    destination = inter_rep.createOpIR_Node(var1, var2, op, destination);		
+	    var2 = destination;
+
+	}
+
+	return destination;
+	
+    }
+
+    /* Do I neeed to grab the var and op from outside of the while loop???
+     *
+     */
+    private String traverseExpression(ArrayList<String> expression){
+	Stack<String> computeStack = new Stack<String>();
+	String destination = null;
+
+	while(!expression.isEmpty()){
+	    /*System.out.println("\n");
+	    for(int i = 0; i < expression.size(); i++){
+		System.out.println("Before var grab: " + expression.get(i));
+		}*/
+
+	    String nextVar = expression.get(0);
+	    expression.remove(0);
+	    //System.out.println("val: " + nextVar);
+	    
+	    //Terminating Condition for direct assignment or end of an expression
+	    if(expression.isEmpty()){
+		computeStack.push(nextVar);
+		return executeStack(computeStack);
+	    }
+
+	    /*System.out.println("\n");
+	    for(int i = 0; i < expression.size(); i++){
+		System.out.println("Before SubExp check: " + expression.get(i));
+		}*/
+
+	    //A recursive call executes here when a sub-expression is found
+	    //Either the result register of a subExpression or the value of nextVar is pushed onto the compute stack.
+	    if(nextVar.equals(LPAR)){
+		ArrayList<String> subExp = grabSubExpression(expression);
+		destination = traverseExpression(subExp);
+		computeStack.push(destination);
+
+		//For the case where the expression ends with a subexpression
+		if(expression.isEmpty()){
+		    destination = executeStack(computeStack);
+		    return destination;
+		}
+	    } else {
+		computeStack.push(nextVar);
+	    }
+
+	    /*System.out.println("\n");
+	    for(int i = 0; i < expression.size(); i++){
+		System.out.println("Before nextOp grab: " + expression.get(i));
+		}*/
+
+	    //The stack will always have at least two more items if it is not empty after popping a variable
+	    String nextOp = expression.get(0);
+	    expression.remove(0);
+	    //System.out.println("op: " + nextOp);
+
+	    if( (nextOp.equals(ADD) || nextOp.equals(SUB)) && computeStack.size() != 1){
+		destination = executeStack(computeStack);
+		computeStack.push(destination);
+	    }
+
+	    computeStack.push(nextOp);
+
+	}
+
+	return destination;
+	
+    }
+
+    
+}

@@ -1,0 +1,682 @@
+import java.io.*;
+import org.antlr.v4.runtime.ANTLRFileStream;
+import org.antlr.v4.runtime.*;
+import java.util.Scanner;
+import java.util.LinkedList;
+import java.util.Stack;
+import java.util.ArrayList;
+import java.util.HashMap;
+
+/**
+ * All variables are defined globally, none are defined within main.
+ * There is only the main function with no calls to other functions.
+ * Loops and if statement are NOT included.
+ *
+ * Get a list of variable declarations. These are decalared as, "var a", for the tinycode but not used for the IR code.
+ *     RuleName = var_decl
+ * Go line by line grabbing each assignment expression and READ/WRTITE expressions.
+ * Make sure to preserve the order of in which the assignments occur as well as the READ/WRITE occurances.
+ *     Rule for READ/WRITE = read_stmt / write_stmt
+ *     Rule for variable expressions = assign_expr
+ *
+ * Note: The order should be preserved by the walker since the functions for each rule execute as the walker comes across each section designated by the rule
+ *
+ *
+ * How am I going to build the IR representation?
+ * Rules where the components are other rules will require a separate recursive function in order to go through each rule layer.
+ * The purpose of the separate function will be to parse the parts of the context component that we need in order to create our instruction.
+ * Variable declarations should not be part of the IR code, so we can add them to the linked list but not print them in the IR code.
+ *      The declarations will always come first since none are declared within main.
+ */
+
+public class AntlrMicroListener extends MicroBaseListener {
+    public static final String MUL = "*";
+    public static final String DIV = "/";
+    public static final String ADD = "+";
+    public static final String SUB = "-";
+    public static final String LPAR = "(";
+    public static final String RPAR = ")";
+ 
+    private LinkedList<IR_Node> inter_rep;
+    private LinkedList<Tiny_Node> tiny_varDecl;
+    private ArrayList<String> expr_comp;//Note that this is being used as a stack
+    private HashMap<String, String> typeDictionary;
+    private int regCounter;
+
+
+    public AntlrMicroListener(){
+	inter_rep = new LinkedList<IR_Node>();
+	inter_rep.add(new IR_Node("IR code", "", "", ""));
+	tiny_varDecl = new LinkedList<Tiny_Node>();
+	expr_comp = new ArrayList<String>();
+	typeDictionary = new HashMap<String, String>();
+	regCounter = 1;
+    }
+    
+    public LinkedList<IR_Node> getInterRep(){
+	return inter_rep;
+    }
+
+    public LinkedList<Tiny_Node> getTiny_varDecl(){
+	return tiny_varDecl;
+    }
+
+    public void printIR_rep(){
+	for(int i = 0; i < inter_rep.size(); i++){
+	    IR_Node node = inter_rep.get(i);
+	    node.print();
+	}
+    }
+
+    public void printExpr_comp(){
+	for(int i = 0; i < expr_comp.size(); i++){
+	    System.out.println(expr_comp.get(i));
+	}
+    }
+    
+    @Override
+    public void exitVar_decl(MicroParser.Var_declContext ctx){
+	MicroParser.Id_listContext varNames = ctx.id_list();
+	MicroParser.Var_typeContext varType = ctx.var_type();
+	String[] varList = varNames.getText().split(",");
+	
+	for(int i = 0; i < varList.length; i++){
+	    Tiny_Node node = new Tiny_Node("var", varList[i], "");
+	    tiny_varDecl.add(node);
+
+	    typeDictionary.put(varList[i], varType.getText());
+	}
+
+	return;
+    }
+
+
+    @Override
+    public void exitRead_stmt(MicroParser.Read_stmtContext ctx){
+	MicroParser.Id_listContext varList = ctx.id_list();
+	//use createReadOpNode()
+
+	//System.out.println("Read" + varList.getText());
+    }
+
+    @Override
+    public void exitWrite_stmt(MicroParser.Write_stmtContext ctx){
+	String varList = ctx.id_list().getText();
+	//use createWriteOpNode()
+	
+	String[] ids = varList.split(",");
+
+	for(int i = 0; i < ids.length; i++){
+	    String dest = getCurrentRegister();
+	    createWriteIR_Node(ids[i]);
+	}
+
+    }
+
+    public void enterPrimary(MicroParser.PrimaryContext ctx){
+	String temp = ctx.getText();
+        String firstChar = String.valueOf(temp.charAt(0));
+	if(firstChar.equals(LPAR)){
+	    expr_comp.add(LPAR);
+	} else {
+	    expr_comp.add(temp);
+	}
+    }
+
+    public void exitPrimary(MicroParser.PrimaryContext ctx){
+	String temp = ctx.getText();
+	String lastChar = String.valueOf(temp.charAt(temp.length() - 1));
+	if(lastChar.equals(RPAR)){
+	    expr_comp.add(RPAR);
+	}
+    }
+
+    public void exitAddop(MicroParser.AddopContext ctx){
+	expr_comp.add(ctx.getText());
+	//System.out.println("Addop: " + ctx.getText());
+	
+    }
+
+    public void exitMulop(MicroParser.MulopContext ctx){
+	expr_comp.add(ctx.getText());	
+	//System.out.println("Mulop: " + ctx.getText());
+	
+    }
+
+    @Override
+    public void enterAssign_expr(MicroParser.Assign_exprContext ctx){
+	String lhs = ctx.id().getText();
+	MicroParser.ExprContext rhs = ctx.expr();
+	
+	expr_comp.add(lhs);
+	//System.out.println("\nexpr: " + rhs.getText());
+       	
+    }
+
+    @Override
+    public void exitAssign_expr(MicroParser.Assign_exprContext ctx){    
+	String lhs = ctx.id().getText();	
+
+	//The arraylist has been filled with the expression, now create the IR_Nodes
+	createExpressionIR_nodes();
+    }
+
+    private ArrayList<String> grabSubExpression(){
+	ArrayList<String> subExp = new ArrayList<String>();
+		
+	for(int i = 0; !expr_comp.isEmpty(); i++){
+	    String temp = expr_comp.get(0);
+	    expr_comp.remove(0);
+
+	    //System.out.println("\n flag: " + temp);
+	    if(temp.equals(RPAR)){
+		//System.out.println("\n flag2: " + temp);
+		break;
+	    }
+
+
+
+	    subExp.add(temp);
+	}
+
+	//printExpr_comp();
+
+	return subExp;
+    }
+
+    private String testForSubExp(String value){
+	String subExpResult = null;
+
+	if(value == LPAR){
+	    //System.out.println("\nvalue: " + value);
+
+	    ArrayList<String> subExp = grabSubExpression();
+	    subExpResult = traverseExpression(subExp);
+	    
+	    return subExpResult;
+	} else{
+	    //System.out.println("\nvalue: " + value);
+	    return value;
+	}
+
+
+ }
+    
+    /*
+     * Returns the register where the result of the expression parameter is stored.
+     * 
+     */
+    private String traverseExpression(ArrayList<String> expression){
+	String destination1 = null;
+	String destination2 = null;
+
+	for(int i = 0; !expression.isEmpty(); i++){
+
+	    /*
+	    for(int j = 0; j < expression.size(); j++){
+		System.out.println("\n" + expression.get(j));
+		}*/
+
+	    String subExpResult1 = null;
+	    if(i == 0){
+		String operand1 = expression.get(0);
+		expression.remove(0);
+
+		//System.out.println("\nBefore operand1: " + subExpResult1);
+
+		subExpResult1 = testForSubExp(operand1);
+
+		//System.out.println("\nAfter operand1: " + subExpResult1);
+	    } else{
+		subExpResult1 = destination2;
+		//System.out.println("\nIterated operand1: " + subExpResult1);
+
+	    }
+
+
+
+	    //Terminating Condition 1
+	    if(expression.isEmpty()){
+		//Create node for direct assignment
+		String destination = getCurrentRegister();
+		createStoreIR_Node(subExpResult1, destination);
+
+		return destination;
+	    }	
+
+	    String op1 = expression.get(0);
+	    expression.remove(0);
+
+	    //System.out.println("\nop1: " + op1);	
+
+	    String operand2 = expression.get(0);
+	    expression.remove(0);
+
+	    //System.out.println("\nBefore operand2: " + operand2);
+
+	    String subExpResult2 = testForSubExp(operand2);
+
+	    //System.out.println("\nAfter operand2: " + subExpResult2);
+
+	    //Terminating Condition 2
+	    if(expression.isEmpty()){
+		//Create node of the form, a op b.
+		String destination = getCurrentRegister();
+		destination = createOpIR_Node(subExpResult1, subExpResult2, op1, destination);		
+
+		return destination;
+	    }	
+
+	    String op2 = expression.get(0);
+	    expression.remove(0);
+
+	    //System.out.println("\nop2: " + op2);
+
+	    String operand3 = expression.get(0);
+	    expression.remove(0);
+
+	    //System.out.println("\nBefore operand3: " + operand3);
+	
+	    String subExpResult3 = testForSubExp(operand3);
+
+	    //System.out.println("\nAfter operand3: " + subExpResult3);
+
+	    //Terminating Condition 3
+	    //Create node for the form, a op b op c.
+
+	    //Cases ADD, SUB do the same thing
+	    //Cases MUL, DIV do the same thing
+	    
+	    switch(op1){
+	    case SUB:
+		destination1 = getCurrentRegister();
+		destination1 = createOpIR_Node(subExpResult2, subExpResult3, op2, destination1);
+		destination2 = getCurrentRegister();
+		destination2 = createOpIR_Node(subExpResult1, destination1, op1, destination2);
+		break;
+
+	    case ADD:
+		destination1 = getCurrentRegister();
+		destination1 = createOpIR_Node(subExpResult2, subExpResult3, op2, destination1);
+		destination2 = getCurrentRegister();
+		destination2 = createOpIR_Node(subExpResult1, destination1, op1, destination2);
+		break;
+
+	    case DIV:
+		destination1 = getCurrentRegister();
+		destination1 = createOpIR_Node(subExpResult1, subExpResult2, op1, destination1);
+		destination2 = getCurrentRegister();
+		destination2 = createOpIR_Node(destination1, subExpResult3, op2, destination2);
+		break;
+		
+	    case MUL:
+		destination1 = getCurrentRegister();
+		destination1 = createOpIR_Node(subExpResult1, subExpResult2, op1, destination1);
+		destination2 = getCurrentRegister();
+		destination2 = createOpIR_Node(destination1, subExpResult3, op2, destination2);
+		break;
+
+	    default:
+		return "Error returned default on 3rd terminating case";
+
+	    }
+
+	    //System.out.println("bitchass" + destination2);
+	    
+	}
+
+	return destination2;
+
+    }
+
+    //Note that removing an item from an array list causes the others to shift over.
+    //Adjust your index correctly when removing items.
+    //If we are always grabbing and removing the first element this can behave as a stack.
+    private void createExpressionIR_nodes(){
+	String lhs = expr_comp.get(0);
+	expr_comp.remove(0);
+
+	String rhsResult = traverseExpression(expr_comp);
+
+	String destination = getCurrentRegister();
+	//System.out.println(rhsResult);
+	createStoreIR_Node(rhsResult, lhs);//rhs stored to the lhs
+    }
+
+    //Note: Each time you create an IR_Node you just pass the destination reg w/ the value of currentReg.
+    //The IR_Node creation automatically increments the currentReg.
+
+    private String createOpIR_Node(String value1, String value2, String op, String destination){
+	String val1Type = checkValType(value1);
+	String val2Type = checkValType(value2);
+	boolean isVal1Literal = false;
+	boolean isVal2Literal = false;
+
+	//Check if either value is a literal and if so store it to a temporary register first.
+	if(val1Type.equals("FLOATLITERAL") || val1Type.equals("INTLITERAL")){
+	    createStoreIR_Node(value1, destination);
+	    value1 = destination;//Set to the destination register for the opcode.
+	    isVal1Literal = true;
+	}
+	
+	if(val2Type.equals("FLOATLITERAL") || val2Type.equals("INTLITERAL")){
+	    if(isVal1Literal){
+		destination = getCurrentRegister();
+	    }
+	    createStoreIR_Node(value2, destination);
+	    value2 = destination;
+	    isVal2Literal = true;
+	}
+
+	if(isVal1Literal || isVal2Literal){//Update the destination if either value was a literal
+	    destination = getCurrentRegister();
+	}
+	if(val1Type.equals("FLOAT") || val2Type.equals("FLOAT") || val1Type.equals("FLOATLITERAL") || val2Type.equals("FLOATLITERAL")){
+	    //value1 and value2 are preset to their destination register if they are literals
+	    createFloatOpIR_Node(value1, value2, op, destination);
+	} else {
+	    createIntOpIR_Node(value1, value2, op, destination);
+	}
+
+	return destination;
+    }
+
+
+    private void createIntOpIR_Node(String value1, String value2, String op, String destination){
+	IR_Node node = null;
+
+	switch(op){
+	case MUL:
+	    node = new IR_Node("MULTI", value1, value2, destination);
+	    break;
+	    
+	case DIV:
+	    node = new IR_Node("DIVI", value1, value2, destination);
+	    break;
+
+	case ADD:
+	    node = new IR_Node("ADDI", value1, value2, destination);
+	    break;
+
+	case SUB:
+	    node = new IR_Node("SUBI", value1, value2, destination);
+	    break;
+
+	default: 
+	    break;
+	    
+	}
+	
+	//Add to the linked list
+	inter_rep.add(node);
+
+	//Add to the dictionary
+	addRegToTypeDictionary(destination, "INT");//This is where regCounter is incremented.
+    }
+
+    private void createFloatOpIR_Node(String value1, String value2, String op, String destination){
+	IR_Node node = null;
+
+	switch(op){
+	case MUL:
+	    node = new IR_Node("MULTF", value1, value2, destination);
+	    break;
+	    
+	case DIV:
+	    node = new IR_Node("DIVF", value1, value2, destination);
+	    break;
+
+	case ADD:
+	    node = new IR_Node("ADDF", value1, value2, destination);
+	    break;
+
+	case SUB:
+	    node = new IR_Node("SUBF", value1, value2, destination);
+	    break;
+
+	default:
+	    break;
+	    
+	}
+
+	//Add to the linked list
+	inter_rep.add(node);
+
+	//Add to the dictionary
+	addRegToTypeDictionary(destination, "FLOAT");
+    }
+
+    private void createStoreIR_Node(String value, String destination){
+	String type = checkValType(value);
+	
+	if(type.equals("INT") || type.equals("INTLITERAL")){
+	    IR_Node node = new IR_Node("STOREI", value, "", destination);
+	    //Add to the linked list
+	    inter_rep.add(node);
+	    //Add to the dictionary
+	    addRegToTypeDictionary(destination, "INT");
+	} else {
+	    IR_Node node = new IR_Node("STOREF", value, "", destination);
+	    //Add to the linked list
+	    inter_rep.add(node);
+	    //Add to the dictionary
+	    addRegToTypeDictionary(destination, "FLOAT");
+	}
+
+    }
+
+    private void createWriteIR_Node(String value){
+	String type = checkValType(value);
+	
+	if(type.equals("INT") || type.equals("INTLITERAL")){
+	    IR_Node node = new IR_Node("WRITEI", value, "", "");
+	    //Add to the linked list
+	    inter_rep.add(node);
+	} else {
+	    IR_Node node = new IR_Node("WRITEF", value, "", "");
+	    //Add to the linked list
+	    inter_rep.add(node);
+	}
+
+    }
+
+    private void addRegToTypeDictionary(String value, String type){
+	//Check if value is a reg
+	boolean isReg = false;
+	if(String.valueOf(value.charAt(0)).equals("$")){//destination is a register
+	    isReg = true;
+	} else{
+	    return;
+	}
+
+	//Add to dictionay
+	//Note that it will overwrite existing keys.
+	if(isReg){
+	    typeDictionary.put(value, type);
+	}
+
+
+	//Register Count is incremented
+	regCounter++;
+    }
+
+    private String checkValType(String value){
+	String type = typeDictionary.get(value);
+
+	if(type == null){
+	    if(value.matches("[0-9]*\\.[0-9]+")){
+		return "FLOATLITERAL";
+	    } else if(value.matches("[0-9]+")){
+		return "INTLITERAL";
+	    } else if(String.valueOf(value.charAt(0)).equals("$")){
+		return typeDictionary.get(value);//Lookup the type for the register
+	    } else {
+		System.out.println("ERROR: Value: " + value + "\nNot found to have a type!!!");
+		return type;
+	    }
+	} else{
+	    return type;
+	}
+	
+    }
+
+    private String getCurrentRegister(){
+	return "$T" + regCounter;
+    }
+
+    @Override
+    public void exitExpr_prefix(MicroParser.Expr_prefixContext ctx){
+	//System.out.println("Expr_prefix: " + ctx.getText());
+	
+    }
+
+    public void exitFactor_prefix(MicroParser.Factor_prefixContext ctx){
+	//System.out.println("Factor_prefix: " + ctx.getText());
+	
+    }
+
+
+
+    @Override
+    public void enterFactor(MicroParser.FactorContext ctx){
+	//	System.out.println("Factor: " + ctx.getText());
+    }
+
+
+	/*
+maintain a list in whih you store the result of an expresion
+you keep increasing the size of the list as you find a new expression
+
+    c + (a * b)
+    list: a*b = result
+          c + result
+    stack: a * b
+           c +
+    fill the stack in the order which the operations should occur
+    
+    rather than traversing through an expression grab the individual rules and push on to the stack.
+	*/
+
+	/*
+	
+	MicroParser.Factor_prefixContext factor_prefixCtx = factorCtx.factor_prefix();
+	for(int i = 0; ! factor_prefixCtx.getText().equals(""); i++){
+	    System.out.println("factor_prefix " + i + ": " + factor_prefixCtx.getText());
+	    factor_prefixCtx = factor_prefixCtx.factor_prefix();
+	    
+	    }
+	//stack.push(expr_prefixCtx.getText());
+	
+	
+
+	//Create node for lhs = rhsResult
+
+	//recursiveEval();
+	
+	printExpr_comp();
+	System.out.println("\n Keys: " + typeDictionary.keySet());
+	System.out.println("\n Values: " + typeDictionary.values());
+	*/
+	/*
+	//print out the operations as they should occur
+	
+	//grab the first index, its either (, ), or  a var.
+	String firstInd = expr_comp.get(index);
+	expr_comp.remove(index);
+	if(firstInd.equals(RPAR)){
+	    return;
+	} else if(firstInd.equals(LPAR)){
+	    createExpressionIR_nodes(index);
+	} else{//Variable is found
+	    //Grab the operator
+	    if(expr_comp.size() == 0){
+		return;
+	    }
+	    String op = expr_comp.get(index);
+	    expr_comp.remove(index);
+
+	    //Grab the next primary
+	    String next = expr_comp.get(index);
+	    expr_comp.remove(index);
+
+	    if(next.equals(LPAR)){
+		createExpressionIR_nodes(index);
+	    } else{
+		
+	    }
+	}
+
+	//grab the next index,
+
+	//grab the next variable, its 
+
+	
+    }
+
+    //lhs is the lhs of the assign_expr
+    //expression is the expression to evaluate, this value starts as the rhs and recursively changes w/ anything found in ()
+    private void recursiveEval(String lhs, ArrayList<String> expression){
+	 if(expr_comp.size() == 1){
+	    String value = expr_comp.get(0);
+	    expr_comp.remove(0);
+	    IR_Node node = new IR_Node("instruction params setting lhs = value");
+	} else if(expr_comp.size() == 3){
+	    String value1 = expr_comp.get(0);
+	    expr_comp.remove(0);
+	    String op = expr_comp.get(0);
+	    expr_comp.remove(0);
+	    String value2 = expr_comp.get(0);
+	    expr_comp.remove(0);
+
+	    IR_Node node = new IR_Node("instruction params setting value1 op value2");
+
+	} else if(expr_comp.size() == 5){
+	    String value1 = expr_comp.get(0);
+	    expr_comp.remove(0);
+	    String op1 = expr_comp.get(0);
+	    expr_comp.remove(0);
+	    String value2 = expr_comp.get(0);
+	    expr_comp.remove(0);
+	    String op2 = expr_comp.get(0);
+	    expr_comp.remove(0);
+	    String value3 = expr_comp.get(0);
+	    expr_comp.remove(0);
+
+	    if(op1 == MUL || op1 == DIV){
+		if(op1 == MUL){
+		    int result1 = value1 * value2;
+		    IR_Node node = new IR_Node("value1 * value2");
+
+			
+
+		    
+
+		} else {
+		    int result1 = value1 / value2;
+		    IR_Node node = new IR_Node("value1 / value2");
+
+		    int result2 = result1 / value2;
+		    IR_Node node = new IR_Node("            ");
+		} 
+	    } else if(op2 == MUL || op2 == DIV){
+		if(op2 == MUL){
+		    int result1 = value2 * value3;
+		    IR_Node node = new IR_Node("value2 * value3");
+
+		    int result2 = result1 * value3;
+		    IR_Node node = new IR_Node("            ");
+		} else {
+		    int result1 = value1 / value2;
+		    IR_Node node = new IR_Node("value1 / value2");
+
+		    int result2 = result1 / value2;
+		    IR_Node node = new IR_Node("            ");
+		} 
+	    }
+	    }*/
+
+	
+
+	
+    
+}
